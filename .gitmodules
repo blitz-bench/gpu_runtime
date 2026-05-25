@@ -1,0 +1,9 @@
+[submodule "external/OpenCL-Headers"]
+	path = external/OpenCL-Headers
+	url = https://github.com/KhronosGroup/OpenCL-Headers.git
+[submodule "external/Vulkan-Headers"]
+	path = external/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "external/level-zero"]
+	path = external/level-zero
+	url = https://github.com/oneapi-src/level-zero.git

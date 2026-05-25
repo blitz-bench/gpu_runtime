@@ -1,17 +1,16 @@
 #pragma once
 
-// Calling-convention macros for backends whose runtime libraries declare their
-// entry points with __stdcall on Windows. Getting this wrong on 32-bit Windows
-// corrupts the call stack and crashes the process; on x64 Windows the two
-// conventions happen to be identical but the typedefs must still match the
-// header declarations.
+// Calling-convention macro for the two backends whose entry points use
+// __stdcall on Windows and where we cannot include the vendor headers:
 //
-// Per the official headers:
-//   - cl.h:      CL_API_CALL     = __stdcall  (Windows)
-//   - cuda.h:    CUDAAPI         = __stdcall  (Windows)
-//   - vk_platform.h: VKAPI_CALL  = __stdcall  (Windows)
+//   - CUDA   (cuda.h: CUDAAPI = __stdcall) — NVIDIA license forbids
+//            redistribution of the headers, so we hand-roll declarations.
+//   - HIP    (hip_runtime_api.h on Windows uses __stdcall via HIPAPI) — the
+//            header is MIT-licensed but transitively requires the CUDA / ROCm
+//            SDK installation, so we hand-roll a minimal subset.
 //
-// HIP and Level Zero stay on the default __cdecl on Windows.
+// OpenCL, Vulkan, and Level Zero get the right calling convention directly
+// from their vendored headers (CL_API_CALL, VKAPI_PTR, ZE_APICALL).
 
 #if defined(_WIN32)
 #  define GPGPU_STDCALL __stdcall

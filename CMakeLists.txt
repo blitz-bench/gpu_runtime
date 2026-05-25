@@ -37,11 +37,45 @@ endif()
 add_library(gpu_runtime ${GPGPU_BUILD_MODE} ${GPGPU_SOURCES})
 add_library(gpgpu::gpu_runtime ALIAS gpu_runtime)
 
+set(GPGPU_OPENCL_HEADERS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/OpenCL-Headers)
+set(GPGPU_VULKAN_HEADERS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/Vulkan-Headers/include)
+set(GPGPU_LEVEL_ZERO_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/external/level-zero/include)
+
+foreach(_dir IN ITEMS
+        "${GPGPU_OPENCL_HEADERS_DIR}/CL/cl.h"
+        "${GPGPU_VULKAN_HEADERS_DIR}/vulkan/vulkan_core.h"
+        "${GPGPU_LEVEL_ZERO_DIR}/ze_api.h")
+    if(NOT EXISTS "${_dir}")
+        message(FATAL_ERROR
+            "gpu_runtime: missing vendored header '${_dir}'. "
+            "The OpenCL-Headers, Vulkan-Headers, and level-zero submodules "
+            "under external/ must be checked out. Run "
+            "'git submodule update --init --recursive' from this repo's root.")
+    endif()
+endforeach()
+
 target_include_directories(gpu_runtime
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        # Vendored third-party headers, sourced via git submodules under
+        # external/<name>/. See README.md > "Third-party headers".
+        ${GPGPU_OPENCL_HEADERS_DIR}
+        ${GPGPU_VULKAN_HEADERS_DIR}
+        ${GPGPU_LEVEL_ZERO_DIR}
+)
+
+# OpenCL 3.0 target API level; opt in to deprecated symbols we still query
+# (CL_DEVICE_HOST_UNIFIED_MEMORY is a CL 1.1 attribute deprecated in CL 2.0).
+target_compile_definitions(gpu_runtime PRIVATE
+    CL_TARGET_OPENCL_VERSION=300
+    CL_USE_DEPRECATED_OPENCL_1_1_APIS
+    CL_USE_DEPRECATED_OPENCL_1_2_APIS
+    CL_USE_DEPRECATED_OPENCL_2_0_APIS
+    # We resolve every Vulkan entry point via vkGetInstanceProcAddr, so skip
+    # the function prototypes vulkan_core.h would otherwise emit.
+    VK_NO_PROTOTYPES
 )
 
 target_compile_features(gpu_runtime PUBLIC cxx_std_17)

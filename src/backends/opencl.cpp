@@ -1,71 +1,33 @@
-// OpenCL ICD probe. We dlopen libOpenCL.so.1 (OpenCL.dll on Windows) and
-// resolve only the ICD entry points we need. No vendor SDK is required at
-// build time.
+// OpenCL ICD probe. Uses the vendored Khronos OpenCL-Headers
+// (third_party/OpenCL-Headers/) for type definitions and constant values; the
+// runtime is dlopen'd at runtime, so no link-time vendor SDK is required.
 
 #include "probe.hpp"
 
-#include <array>
+#include <CL/cl.h>
+#include <CL/cl_ext.h>
+
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 #include "../platform/lib_loader.hpp"
 #include "../search_paths.hpp"
-#include "calling_convention.hpp"
 
 namespace gpgpu::backends {
 
 namespace {
 
-using cl_int      = int;
-using cl_uint     = unsigned int;
-using cl_ulong    = unsigned long long;
-using cl_bool     = unsigned int;
-using cl_bitfield = unsigned long long;
-using cl_platform_id = void*;
-using cl_device_id   = void*;
-using cl_device_type = cl_bitfield;
-using cl_device_info = cl_uint;
-using cl_platform_info = cl_uint;
+using PFN_clGetPlatformIDs   = cl_int (CL_API_CALL*)(cl_uint, cl_platform_id*, cl_uint*);
+using PFN_clGetPlatformInfo  = cl_int (CL_API_CALL*)(cl_platform_id, cl_platform_info, std::size_t, void*, std::size_t*);
+using PFN_clGetDeviceIDs     = cl_int (CL_API_CALL*)(cl_platform_id, cl_device_type, cl_uint, cl_device_id*, cl_uint*);
+using PFN_clGetDeviceInfo    = cl_int (CL_API_CALL*)(cl_device_id, cl_device_info, std::size_t, void*, std::size_t*);
 
-constexpr cl_device_type CL_DEVICE_TYPE_ALL    = 0xFFFFFFFFULL;
-constexpr cl_int          CL_SUCCESS            = 0;
-
-constexpr cl_platform_info CL_PLATFORM_NAME      = 0x0902;
-constexpr cl_platform_info CL_PLATFORM_VENDOR    = 0x0903;
-constexpr cl_platform_info CL_PLATFORM_VERSION   = 0x0901;
-
-constexpr cl_device_info CL_DEVICE_TYPE                    = 0x1000;
-constexpr cl_device_info CL_DEVICE_VENDOR_ID               = 0x1001;
-constexpr cl_device_info CL_DEVICE_MAX_COMPUTE_UNITS       = 0x1002;
-constexpr cl_device_info CL_DEVICE_MAX_WORK_GROUP_SIZE     = 0x1004;
-constexpr cl_device_info CL_DEVICE_MAX_CLOCK_FREQUENCY     = 0x100C;
-constexpr cl_device_info CL_DEVICE_GLOBAL_MEM_CACHE_SIZE   = 0x101E;
-constexpr cl_device_info CL_DEVICE_GLOBAL_MEM_SIZE         = 0x101F;
-constexpr cl_device_info CL_DEVICE_LOCAL_MEM_SIZE          = 0x1023;
-constexpr cl_device_info CL_DEVICE_NAME                    = 0x102B;
-constexpr cl_device_info CL_DEVICE_VENDOR                  = 0x102C;
-constexpr cl_device_info CL_DRIVER_VERSION                 = 0x102D;
-constexpr cl_device_info CL_DEVICE_VERSION                 = 0x102F;
-constexpr cl_device_info CL_DEVICE_EXTENSIONS              = 0x1030;
-constexpr cl_device_info CL_DEVICE_NATIVE_VECTOR_WIDTH_DOUBLE = 0x103B;
-constexpr cl_device_info CL_DEVICE_NATIVE_VECTOR_WIDTH_HALF   = 0x103C;
-constexpr cl_device_info CL_DEVICE_HOST_UNIFIED_MEMORY        = 0x1035; // CL 1.1 only
-// NVIDIA + AMD PCI bus extensions.
-constexpr cl_device_info CL_DEVICE_PCI_BUS_ID_NV           = 0x4008;
-constexpr cl_device_info CL_DEVICE_PCI_SLOT_ID_NV          = 0x4009;
-constexpr cl_device_info CL_DEVICE_TOPOLOGY_AMD            = 0x4037;
-// KHR PCI bus info (OpenCL 3.0 + cl_khr_pci_bus_info).
-constexpr cl_device_info CL_DEVICE_PCI_BUS_INFO_KHR        = 0x410F;
-
-using PFN_clGetPlatformIDs   = cl_int (GPGPU_STDCALL*)(cl_uint, cl_platform_id*, cl_uint*);
-using PFN_clGetPlatformInfo  = cl_int (GPGPU_STDCALL*)(cl_platform_id, cl_platform_info, std::size_t, void*, std::size_t*);
-using PFN_clGetDeviceIDs     = cl_int (GPGPU_STDCALL*)(cl_platform_id, cl_device_type, cl_uint, cl_device_id*, cl_uint*);
-using PFN_clGetDeviceInfo    = cl_int (GPGPU_STDCALL*)(cl_device_id, cl_device_info, std::size_t, void*, std::size_t*);
-
-// Matches the cl_amd_device_topology union layout (24 bytes total).
-// The pcie variant stores bus/device/function as signed chars at fixed
-// offsets 21/22/23 after a 17-byte `unused` padding.
+// AMD topology layout (cl_amd_device_topology is declared in cl_ext.h as a
+// union; we use a POD struct here for trivial init and copy).
 struct DeviceTopologyAmd {
     cl_uint type;
     char    unused[17];
@@ -74,12 +36,19 @@ struct DeviceTopologyAmd {
     char    function;
 };
 
+// Khronos PCI bus info extension struct (cl_device_pci_bus_info_khr).
 struct PciBusInfoKhr {
     cl_uint pci_domain;
     cl_uint pci_bus;
     cl_uint pci_device;
     cl_uint pci_function;
 };
+
+// NVIDIA-specific OpenCL extension query keys (cl_nv_device_attribute_query).
+// These are not part of the Khronos headers — NVIDIA documents them in their
+// OpenCL Best Practices Guide but does not contribute them upstream.
+constexpr cl_device_info CL_DEVICE_PCI_BUS_ID_NV  = 0x4008;
+constexpr cl_device_info CL_DEVICE_PCI_SLOT_ID_NV = 0x4009;
 
 std::string info_string(PFN_clGetDeviceInfo fn, cl_device_id dev, cl_device_info key) {
     std::size_t size = 0;
@@ -110,7 +79,6 @@ std::string format_pci_bdf(unsigned domain, unsigned bus, unsigned dev, unsigned
     return buf;
 }
 
-// Trim leading/trailing whitespace.
 std::string trim(std::string s) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
     std::size_t i = 0;
@@ -225,7 +193,6 @@ ProbeResult probe_opencl() {
                 d.set_integrated(unified != 0);
             }
 
-            // Feature flags via extension string.
             std::string exts = info_string(clGetDeviceInfo, dev, CL_DEVICE_EXTENSIONS);
             if (exts.find("cl_khr_fp16") != std::string::npos) d.set_fp16(true);
             if (exts.find("cl_khr_fp64") != std::string::npos) d.set_fp64(true);
@@ -233,7 +200,7 @@ ProbeResult probe_opencl() {
 
             d.set_driver_version(info_string(clGetDeviceInfo, dev, CL_DRIVER_VERSION));
 
-            // Stable id: try KHR PCI bus info, NVIDIA ext, AMD topology, in that order.
+            // Stable id: prefer KHR PCI bus info, then NVIDIA ext, then AMD topology.
             std::string id_str;
             PciBusInfoKhr khr{};
             if (clGetDeviceInfo(dev, CL_DEVICE_PCI_BUS_INFO_KHR, sizeof(khr), &khr, nullptr) == CL_SUCCESS) {
@@ -255,7 +222,6 @@ ProbeResult probe_opencl() {
                 }
             }
             if (id_str.empty()) {
-                // Fallback id: vendor-id + name + uniqueness via pointer.
                 char buf[64];
                 std::snprintf(buf, sizeof(buf), "ocl-%04x-%p", vendor_id, dev);
                 id_str = buf;

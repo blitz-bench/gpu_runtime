@@ -1,129 +1,26 @@
-// Vulkan compute probe. We dlopen libvulkan.so.1 (vulkan-1.dll), pull entry
-// points via vkGetInstanceProcAddr, create a minimal instance and enumerate
-// physical devices.
-//
-// We deliberately avoid Properties2/extensions to keep the implementation
-// portable across drivers and platforms.
+// Vulkan compute probe. Uses the vendored Khronos Vulkan-Headers
+// (third_party/Vulkan-Headers/) for type definitions and constants. The
+// runtime is dlopen'd; CMake defines VK_NO_PROTOTYPES so the header emits
+// types only and we resolve every entry point via vkGetInstanceProcAddr.
 
 #include "probe.hpp"
 
-#include <array>
+#include <vulkan/vulkan_core.h>
+
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "../platform/lib_loader.hpp"
 #include "../search_paths.hpp"
-#include "calling_convention.hpp"
 
 namespace gpgpu::backends {
 
 namespace {
 
-constexpr std::size_t VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256;
-constexpr std::size_t VK_UUID_SIZE = 16;
-constexpr std::size_t VK_MAX_MEMORY_TYPES = 32;
-constexpr std::size_t VK_MAX_MEMORY_HEAPS = 16;
-
-using VkResult           = int;
-using VkInstance         = void*;
-using VkPhysicalDevice   = void*;
-using VkStructureType    = std::uint32_t;
-using VkFlags            = std::uint32_t;
-using VkDeviceSize       = std::uint64_t;
-
-constexpr VkResult VK_SUCCESS = 0;
-constexpr VkResult VK_INCOMPLETE = 5;
-
-constexpr VkStructureType VK_STRUCTURE_TYPE_APPLICATION_INFO = 0;
-constexpr VkStructureType VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO = 1;
-
-constexpr std::uint32_t VK_API_VERSION_1_0 = (1u << 22);
-
-constexpr std::uint32_t VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1;
-
-enum VkPhysicalDeviceType : std::uint32_t {
-    VK_PHYSICAL_DEVICE_TYPE_OTHER          = 0,
-    VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU = 1,
-    VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   = 2,
-    VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    = 3,
-    VK_PHYSICAL_DEVICE_TYPE_CPU            = 4,
-};
-
-struct VkApplicationInfo {
-    VkStructureType sType;
-    const void*     pNext;
-    const char*     pApplicationName;
-    std::uint32_t   applicationVersion;
-    const char*     pEngineName;
-    std::uint32_t   engineVersion;
-    std::uint32_t   apiVersion;
-};
-
-struct VkInstanceCreateInfo {
-    VkStructureType            sType;
-    const void*                pNext;
-    VkFlags                    flags;
-    const VkApplicationInfo*   pApplicationInfo;
-    std::uint32_t              enabledLayerCount;
-    const char* const*         ppEnabledLayerNames;
-    std::uint32_t              enabledExtensionCount;
-    const char* const*         ppEnabledExtensionNames;
-};
-
-// VkPhysicalDeviceLimits is large; we don't need its fields but its size must
-// match. From the Vulkan headers it is 504 bytes on every platform we target.
-struct VkPhysicalDeviceLimits {
-    std::uint8_t opaque[504];
-};
-
-struct VkPhysicalDeviceSparseProperties {
-    std::uint32_t residencyStandard2DBlockShape;
-    std::uint32_t residencyStandard2DMultisampleBlockShape;
-    std::uint32_t residencyStandard3DBlockShape;
-    std::uint32_t residencyAlignedMipSize;
-    std::uint32_t residencyNonResidentStrict;
-};
-
-struct VkPhysicalDeviceProperties {
-    std::uint32_t                    apiVersion;
-    std::uint32_t                    driverVersion;
-    std::uint32_t                    vendorID;
-    std::uint32_t                    deviceID;
-    VkPhysicalDeviceType             deviceType;
-    char                             deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
-    std::uint8_t                     pipelineCacheUUID[VK_UUID_SIZE];
-    VkPhysicalDeviceLimits           limits;
-    VkPhysicalDeviceSparseProperties sparseProperties;
-};
-
-struct VkMemoryType {
-    VkFlags       propertyFlags;
-    std::uint32_t heapIndex;
-};
-
-struct VkMemoryHeap {
-    VkDeviceSize size;
-    VkFlags      flags;
-};
-
-struct VkPhysicalDeviceMemoryProperties {
-    std::uint32_t memoryTypeCount;
-    VkMemoryType  memoryTypes[VK_MAX_MEMORY_TYPES];
-    std::uint32_t memoryHeapCount;
-    VkMemoryHeap  memoryHeaps[VK_MAX_MEMORY_HEAPS];
-};
-
-using PFN_vkVoidFunction = void (GPGPU_STDCALL*)();
-using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction (GPGPU_STDCALL*)(VkInstance, const char*);
-using PFN_vkCreateInstance = VkResult (GPGPU_STDCALL*)(const VkInstanceCreateInfo*, const void*, VkInstance*);
-using PFN_vkDestroyInstance = void (GPGPU_STDCALL*)(VkInstance, const void*);
-using PFN_vkEnumeratePhysicalDevices = VkResult (GPGPU_STDCALL*)(VkInstance, std::uint32_t*, VkPhysicalDevice*);
-using PFN_vkGetPhysicalDeviceProperties = void (GPGPU_STDCALL*)(VkPhysicalDevice, VkPhysicalDeviceProperties*);
-using PFN_vkGetPhysicalDeviceMemoryProperties = void (GPGPU_STDCALL*)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*);
-using PFN_vkEnumerateInstanceVersion = VkResult (GPGPU_STDCALL*)(std::uint32_t*);
-
-std::string format_pci_uuid(const std::uint8_t u[VK_UUID_SIZE]) {
+std::string format_uuid(const std::uint8_t u[VK_UUID_SIZE]) {
     char buf[40];
     std::snprintf(buf, sizeof(buf),
                   "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -133,10 +30,9 @@ std::string format_pci_uuid(const std::uint8_t u[VK_UUID_SIZE]) {
 }
 
 std::string format_api_version(std::uint32_t v) {
-    // VK_VERSION_MAJOR/MINOR/PATCH macros: major=v>>22, minor=(v>>12)&0x3FF, patch=v&0xFFF
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%u.%u.%u",
-                  (v >> 22) & 0x7Fu, (v >> 12) & 0x3FFu, v & 0xFFFu);
+                  VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v), VK_API_VERSION_PATCH(v));
     return buf;
 }
 
@@ -163,7 +59,7 @@ ProbeResult probe_vulkan() {
     }
 
     auto get_global = [&](const char* name) {
-        return vkGetInstanceProcAddr(nullptr, name);
+        return vkGetInstanceProcAddr(VK_NULL_HANDLE, name);
     };
 
     auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(get_global("vkCreateInstance"));
@@ -195,7 +91,7 @@ ProbeResult probe_vulkan() {
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ci.pApplicationInfo = &app;
 
-    VkInstance instance = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
     VkResult r = vkCreateInstance(&ci, nullptr, &instance);
     if (r != VK_SUCCESS || !instance) {
         out.backend = Backend(BackendId::Vulkan, instance_version_str, lib_path,
@@ -265,7 +161,7 @@ ProbeResult probe_vulkan() {
         // driver+device pair across boots).
         char id[80];
         std::snprintf(id, sizeof(id), "vk-%04x:%04x-%s", props.vendorID, props.deviceID,
-                      format_pci_uuid(props.pipelineCacheUUID).c_str());
+                      format_uuid(props.pipelineCacheUUID).c_str());
         d.set_id(id);
 
         out.devices.push_back(std::move(d));

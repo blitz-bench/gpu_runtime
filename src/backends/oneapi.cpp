@@ -1,12 +1,16 @@
-// Intel OneAPI / Level Zero probe. We dlopen libze_loader.so.1 and use the
-// stable subset of the Level Zero API: zeInit, zeDriverGet,
-// zeDriverGetApiVersion, zeDeviceGet, zeDeviceGetProperties.
+// Intel OneAPI / Level Zero probe. Uses the vendored Level Zero header
+// (third_party/level-zero/ze_api.h) for type definitions and constants. The
+// runtime is dlopen'd; no link-time vendor SDK is required.
 
 #include "probe.hpp"
 
+#include <ze_api.h>
+
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "../platform/lib_loader.hpp"
 #include "../search_paths.hpp"
@@ -15,102 +19,25 @@ namespace gpgpu::backends {
 
 namespace {
 
-constexpr std::size_t ZE_MAX_DEVICE_NAME = 256;
-constexpr std::size_t ZE_MAX_UUID_SIZE = 16;
-
-using ze_result_t = std::uint32_t;
-using ze_driver_handle_t = void*;
-using ze_device_handle_t = void*;
-
-constexpr ze_result_t ZE_RESULT_SUCCESS = 0;
-
-enum ze_init_flag_t : std::uint32_t {
-    ZE_INIT_FLAG_GPU_ONLY = 0x1,
-};
-
-enum ze_structure_type_t : std::uint32_t {
-    ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES = 0x1,
-    ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES = 0x2,
-    ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES = 0x4,
-};
-
-enum ze_device_type_t : std::uint32_t {
-    ZE_DEVICE_TYPE_GPU = 1,
-    ZE_DEVICE_TYPE_CPU = 2,
-    ZE_DEVICE_TYPE_FPGA = 3,
-    ZE_DEVICE_TYPE_MCA = 4,
-    ZE_DEVICE_TYPE_VPU = 5,
-};
-
-constexpr std::uint32_t ZE_DEVICE_PROPERTY_FLAG_INTEGRATED = 0x1;
-
-struct ze_device_uuid_t {
-    std::uint8_t id[ZE_MAX_UUID_SIZE];
-};
-
-struct ze_device_properties_t {
-    ze_structure_type_t stype;
-    void*               pNext;
-    ze_device_type_t    type;
-    std::uint32_t       vendorId;
-    std::uint32_t       deviceId;
-    std::uint32_t       flags;
-    std::uint32_t       subdeviceId;
-    std::uint32_t       coreClockRate;
-    std::uint64_t       maxMemAllocSize;
-    std::uint32_t       maxHardwareContexts;
-    std::uint32_t       maxCommandQueuePriority;
-    std::uint32_t       numThreadsPerEU;
-    std::uint32_t       physicalEUSimdWidth;
-    std::uint32_t       numEUsPerSubslice;
-    std::uint32_t       numSubslicesPerSlice;
-    std::uint32_t       numSlices;
-    std::uint64_t       timerResolution;
-    std::uint32_t       timestampValidBits;
-    std::uint32_t       kernelTimestampValidBits;
-    ze_device_uuid_t    uuid;
-    char                name[ZE_MAX_DEVICE_NAME];
-};
-
-struct ze_device_compute_properties_t {
-    ze_structure_type_t stype;
-    void*               pNext;
-    std::uint32_t       maxTotalGroupSize;
-    std::uint32_t       maxGroupSizeX;
-    std::uint32_t       maxGroupSizeY;
-    std::uint32_t       maxGroupSizeZ;
-    std::uint32_t       maxGroupCountX;
-    std::uint32_t       maxGroupCountY;
-    std::uint32_t       maxGroupCountZ;
-    std::uint32_t       maxSharedLocalMemory;
-    std::uint32_t       numSubGroupSizes;
-    std::uint32_t       subGroupSizes[8];
-};
-
-struct ze_device_memory_properties_t {
-    ze_structure_type_t stype;
-    void*               pNext;
-    std::uint32_t       flags;
-    std::uint32_t       maxClockRate;
-    std::uint32_t       maxBusWidth;
-    std::uint64_t       totalSize;
-    char                name[ZE_MAX_DEVICE_NAME];
-};
-
-using PFN_zeInit                       = ze_result_t (*)(std::uint32_t);
-using PFN_zeDriverGet                  = ze_result_t (*)(std::uint32_t*, ze_driver_handle_t*);
-using PFN_zeDriverGetApiVersion        = ze_result_t (*)(ze_driver_handle_t, std::uint32_t*);
-using PFN_zeDeviceGet                  = ze_result_t (*)(ze_driver_handle_t, std::uint32_t*, ze_device_handle_t*);
-using PFN_zeDeviceGetProperties        = ze_result_t (*)(ze_device_handle_t, ze_device_properties_t*);
-using PFN_zeDeviceGetComputeProperties = ze_result_t (*)(ze_device_handle_t, ze_device_compute_properties_t*);
-using PFN_zeDeviceGetMemoryProperties  = ze_result_t (*)(ze_device_handle_t, std::uint32_t*, ze_device_memory_properties_t*);
+// ze_api.h declares the API functions but does not provide
+// function-pointer typedefs for them (only callback typedefs for the
+// tracing layer). We declare the small subset we resolve via dlopen.
+// ZE_APICALL comes from the vendored header so the calling convention
+// stays correct on every platform.
+using PFN_zeInit                       = ze_result_t (ZE_APICALL*)(ze_init_flags_t);
+using PFN_zeDriverGet                  = ze_result_t (ZE_APICALL*)(uint32_t*, ze_driver_handle_t*);
+using PFN_zeDriverGetApiVersion        = ze_result_t (ZE_APICALL*)(ze_driver_handle_t, ze_api_version_t*);
+using PFN_zeDeviceGet                  = ze_result_t (ZE_APICALL*)(ze_driver_handle_t, uint32_t*, ze_device_handle_t*);
+using PFN_zeDeviceGetProperties        = ze_result_t (ZE_APICALL*)(ze_device_handle_t, ze_device_properties_t*);
+using PFN_zeDeviceGetComputeProperties = ze_result_t (ZE_APICALL*)(ze_device_handle_t, ze_device_compute_properties_t*);
+using PFN_zeDeviceGetMemoryProperties  = ze_result_t (ZE_APICALL*)(ze_device_handle_t, uint32_t*, ze_device_memory_properties_t*);
 
 bool ok(ze_result_t r) { return r == ZE_RESULT_SUCCESS; }
 
-std::string format_api_version(std::uint32_t v) {
-    // ze_api_version_t is encoded as ((major) << 16) | minor.
+std::string format_api_version(ze_api_version_t v) {
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%u.%u", (v >> 16) & 0xFFFFu, v & 0xFFFFu);
+    std::snprintf(buf, sizeof(buf), "%u.%u",
+                  ZE_MAJOR_VERSION(v), ZE_MINOR_VERSION(v));
     return buf;
 }
 
@@ -152,7 +79,6 @@ ProbeResult probe_oneapi() {
     }
 
     if (!ok(zeInit(ZE_INIT_FLAG_GPU_ONLY))) {
-        // Some loaders require zeInit(0) instead.
         if (!ok(zeInit(0))) {
             out.backend = Backend(BackendId::OneAPI, /*version*/ {}, lib_path,
                                   BackendStatus::MissingDriver,
@@ -174,7 +100,7 @@ ProbeResult probe_oneapi() {
     std::string best_api_version;
     for (auto drv : drivers) {
         if (zeDriverGetApiVersion) {
-            std::uint32_t api = 0;
+            ze_api_version_t api = ZE_API_VERSION_1_0;
             if (ok(zeDriverGetApiVersion(drv, &api))) {
                 auto s = format_api_version(api);
                 if (s > best_api_version) best_api_version = s;
@@ -201,19 +127,17 @@ ProbeResult probe_oneapi() {
             if (props.coreClockRate > 0) d.set_frequency(props.coreClockRate);
             d.set_integrated((props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0);
 
-            // Compute properties: subgroup size + shared memory + max workgroup.
             if (zeDeviceGetCompute) {
                 ze_device_compute_properties_t cp{};
                 cp.stype = ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES;
                 if (ok(zeDeviceGetCompute(h, &cp))) {
                     if (cp.maxTotalGroupSize > 0) d.set_max_workgroup_size(cp.maxTotalGroupSize);
                     if (cp.maxSharedLocalMemory > 0) d.set_shared_memory_per_block(cp.maxSharedLocalMemory);
-                    if (cp.numSubGroupSizes > 0) d.set_subgroup_size(cp.subGroupSizes[cp.numSubGroupSizes - 1]);
+                    if (cp.numSubGroupSizes > 0)
+                        d.set_subgroup_size(cp.subGroupSizes[cp.numSubGroupSizes - 1]);
                 }
             }
 
-            // Memory properties: sum across heaps for total device memory; pick
-            // the widest bus for memory_bus_width_bits.
             if (zeDeviceGetMemory) {
                 std::uint32_t n_mem = 0;
                 zeDeviceGetMemory(h, &n_mem, nullptr);
@@ -240,7 +164,6 @@ ProbeResult probe_oneapi() {
                 }
             }
 
-            // EUs are the closest Intel analog to CUDA SMs.
             if (props.numSlices && props.numSubslicesPerSlice && props.numEUsPerSubslice) {
                 std::uint32_t eus = props.numSlices * props.numSubslicesPerSlice * props.numEUsPerSubslice;
                 d.set_compute_units(eus);
@@ -251,8 +174,6 @@ ProbeResult probe_oneapi() {
 
             if (!best_api_version.empty()) d.set_driver_version(best_api_version);
 
-            // Intel GPUs have FP16 and INT8 on all Xe generations; FP64 is
-            // gated by SKU. We optimistically flag FP16/INT8.
             d.set_fp16(true);
             d.set_int8(true);
 
