@@ -1,0 +1,3 @@
+add_executable(gpu_runtime_query main.cpp)
+target_link_libraries(gpu_runtime_query PRIVATE gpu_runtime)
+target_compile_features(gpu_runtime_query PRIVATE cxx_std_17)
