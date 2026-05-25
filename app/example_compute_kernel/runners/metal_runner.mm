@@ -62,11 +62,12 @@ RunResult run_vector_add_metal(const gpgpu::Setup&    setup,
     const std::size_t n     = a.size();
     const std::size_t bytes = n * sizeof(float);
 
+    r.timings.copy_h2d_size = 2 * bytes;
+    r.timings.copy_d2h_size = bytes;
+
     @autoreleasepool {
         id<MTLDevice> device = find_matching_device(setup.device);
         if (!device) { r.error = "no Metal device matched " + setup.device.id(); return r; }
-
-        auto t0 = std::chrono::steady_clock::now();
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (!queue) { r.error = "newCommandQueue failed"; return r; }
@@ -92,17 +93,24 @@ RunResult run_vector_add_metal(const gpgpu::Setup&    setup,
             return r;
         }
 
-        id<MTLBuffer> buf_a = [device newBufferWithBytes:a.data()
-                                                  length:bytes
-                                                 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_b = [device newBufferWithBytes:b.data()
-                                                  length:bytes
-                                                 options:MTLResourceStorageModeShared];
+        // Shared-storage buffers: upload/download is a pure host memcpy
+        // into [buf contents]. We time each memcpy on the host clock.
+        id<MTLBuffer> buf_a = [device newBufferWithLength:bytes
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_b = [device newBufferWithLength:bytes
+                                                  options:MTLResourceStorageModeShared];
         id<MTLBuffer> buf_c = [device newBufferWithLength:bytes
                                                   options:MTLResourceStorageModeShared];
         if (!buf_a || !buf_b || !buf_c) { r.error = "newBufferWith* failed"; return r; }
 
         std::uint32_t n_arg = static_cast<std::uint32_t>(n);
+
+        const auto t_total_start = std::chrono::steady_clock::now();
+
+        const auto t_h2d_start = std::chrono::steady_clock::now();
+        std::memcpy([buf_a contents], a.data(), bytes);
+        std::memcpy([buf_b contents], b.data(), bytes);
+        r.timings.copy_h2d = std::chrono::steady_clock::now() - t_h2d_start;
 
         id<MTLCommandBuffer> cmd = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -117,13 +125,22 @@ RunResult run_vector_add_metal(const gpgpu::Setup&    setup,
         [enc dispatchThreads:MTLSizeMake(n, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         [enc endEncoding];
+
+        const auto t_launch_start = std::chrono::steady_clock::now();
         [cmd commit];
+        r.timings.kernel_launch = std::chrono::steady_clock::now() - t_launch_start;
+
         [cmd waitUntilCompleted];
 
-        std::memcpy(c.data(), [buf_c contents], bytes);
+        // MTLCommandBuffer exposes GPU{Start,End}Time as NSTimeInterval (seconds).
+        const double gpu_seconds = [cmd GPUEndTime] - [cmd GPUStartTime];
+        if (gpu_seconds > 0.0) r.timings.kernel_compute = std::chrono::duration<double>{gpu_seconds};
 
-        auto t1 = std::chrono::steady_clock::now();
-        r.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+        const auto t_d2h_start = std::chrono::steady_clock::now();
+        std::memcpy(c.data(), [buf_c contents], bytes);
+        r.timings.copy_d2h = std::chrono::steady_clock::now() - t_d2h_start;
+
+        r.timings.total = std::chrono::steady_clock::now() - t_total_start;
     }
 
     for (std::size_t i = 0; i < n; ++i) {

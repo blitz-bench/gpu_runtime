@@ -64,6 +64,8 @@ using PFN_clEnqueueNDRangeKernel = cl_int (CL_API_CALL*)(cl_command_queue, cl_ke
 using PFN_clEnqueueReadBuffer = cl_int (CL_API_CALL*)(cl_command_queue, cl_mem, cl_bool, std::size_t, std::size_t,
                                                       void*, cl_uint, const cl_event*, cl_event*);
 using PFN_clFinish            = cl_int (CL_API_CALL*)(cl_command_queue);
+using PFN_clGetEventProfilingInfo = cl_int (CL_API_CALL*)(cl_event, cl_profiling_info, std::size_t, void*, std::size_t*);
+using PFN_clReleaseEvent      = cl_int (CL_API_CALL*)(cl_event);
 using PFN_clReleaseMemObject  = cl_int (CL_API_CALL*)(cl_mem);
 using PFN_clReleaseKernel     = cl_int (CL_API_CALL*)(cl_kernel);
 using PFN_clReleaseProgram    = cl_int (CL_API_CALL*)(cl_program);
@@ -86,6 +88,8 @@ struct ClApi {
     PFN_clEnqueueNDRangeKernel             EnqueueNDRangeKernel;
     PFN_clEnqueueReadBuffer                EnqueueReadBuffer;
     PFN_clFinish                           Finish;
+    PFN_clGetEventProfilingInfo            GetEventProfilingInfo;
+    PFN_clReleaseEvent                     ReleaseEvent;
     PFN_clReleaseMemObject                 ReleaseMemObject;
     PFN_clReleaseKernel                    ReleaseKernel;
     PFN_clReleaseProgram                   ReleaseProgram;
@@ -109,6 +113,8 @@ bool resolve(const loader::Lib& lib, ClApi& api) {
     api.EnqueueNDRangeKernel             = lib.sym<PFN_clEnqueueNDRangeKernel>("clEnqueueNDRangeKernel");
     api.EnqueueReadBuffer                = lib.sym<PFN_clEnqueueReadBuffer>("clEnqueueReadBuffer");
     api.Finish                           = lib.sym<PFN_clFinish>("clFinish");
+    api.GetEventProfilingInfo            = lib.sym<PFN_clGetEventProfilingInfo>("clGetEventProfilingInfo");
+    api.ReleaseEvent                     = lib.sym<PFN_clReleaseEvent>("clReleaseEvent");
     api.ReleaseMemObject                 = lib.sym<PFN_clReleaseMemObject>("clReleaseMemObject");
     api.ReleaseKernel                    = lib.sym<PFN_clReleaseKernel>("clReleaseKernel");
     api.ReleaseProgram                   = lib.sym<PFN_clReleaseProgram>("clReleaseProgram");
@@ -120,8 +126,19 @@ bool resolve(const loader::Lib& lib, ClApi& api) {
            api.BuildProgram && api.CreateKernel && api.SetKernelArg &&
            api.EnqueueWriteBuffer && api.EnqueueNDRangeKernel &&
            api.EnqueueReadBuffer && api.Finish &&
+           api.GetEventProfilingInfo && api.ReleaseEvent &&
            api.ReleaseMemObject && api.ReleaseKernel && api.ReleaseProgram &&
            api.ReleaseCommandQueue && api.ReleaseContext;
+}
+
+// Convert two CL_PROFILING_COMMAND_* nanosecond timestamps to a chrono
+// duration<double>.
+std::chrono::duration<double> event_span(const ClApi& api, cl_event start, cl_event end) {
+    cl_ulong t0 = 0, t1 = 0;
+    api.GetEventProfilingInfo(start, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr);
+    api.GetEventProfilingInfo(end,   CL_PROFILING_COMMAND_END,   sizeof(t1), &t1, nullptr);
+    if (t1 <= t0) return std::chrono::duration<double>{0};
+    return std::chrono::duration<double>{(t1 - t0) / 1.0e9};
 }
 
 std::string read_info_string(const ClApi& api, cl_device_id dev, cl_device_info key) {
@@ -199,13 +216,19 @@ RunResult run_vector_add_opencl(const gpgpu::Setup&    setup,
     cl_device_id device = find_matching_device(api, setup.device);
     if (!device) { r.error = "no OpenCL device matched setup.device"; return r; }
 
-    cl_int err = CL_SUCCESS;
-    auto t0 = std::chrono::steady_clock::now();
+    r.timings.copy_h2d_size = 2 * bytes;
+    r.timings.copy_d2h_size = bytes;
 
+    cl_int err = CL_SUCCESS;
     cl_context context = api.CreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
     if (!context || err != CL_SUCCESS) { r.error = "clCreateContext err=" + std::to_string(err); return r; }
 
-    const cl_queue_properties qprops[] = {0};
+    // CL_QUEUE_PROFILING_ENABLE = 1 << 1; we enable per-command timestamps so
+    // we can ask for device-side START/END timestamps later.
+    const cl_queue_properties qprops[] = {
+        CL_QUEUE_PROPERTIES, static_cast<cl_queue_properties>(CL_QUEUE_PROFILING_ENABLE),
+        0
+    };
     cl_command_queue queue = api.CreateCommandQueueWithProperties(context, device, qprops, &err);
     if (!queue) {
         api.ReleaseContext(context);
@@ -248,9 +271,6 @@ RunResult run_vector_add_opencl(const gpgpu::Setup&    setup,
         r.error = "clCreateKernel err=" + std::to_string(err); return r;
     }
 
-    api.EnqueueWriteBuffer(queue, buf_a, CL_TRUE, 0, bytes, a.data(), 0, nullptr, nullptr);
-    api.EnqueueWriteBuffer(queue, buf_b, CL_TRUE, 0, bytes, b.data(), 0, nullptr, nullptr);
-
     cl_uint n_arg = static_cast<cl_uint>(n);
     api.SetKernelArg(kernel, 0, sizeof(cl_mem),  &buf_a);
     api.SetKernelArg(kernel, 1, sizeof(cl_mem),  &buf_b);
@@ -259,15 +279,38 @@ RunResult run_vector_add_opencl(const gpgpu::Setup&    setup,
 
     const std::size_t global = ((n + kLocalSize - 1) / kLocalSize) * kLocalSize;
     const std::size_t local  = kLocalSize;
-    if (api.EnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global, &local, 0, nullptr, nullptr) != CL_SUCCESS) {
+
+    // --- timed section: enqueue async with profiling events, then sync once.
+    cl_event ev_h2d_a = nullptr, ev_h2d_b = nullptr, ev_kernel = nullptr, ev_d2h = nullptr;
+    const auto t_total_start = std::chrono::steady_clock::now();
+
+    api.EnqueueWriteBuffer(queue, buf_a, CL_FALSE, 0, bytes, a.data(), 0, nullptr, &ev_h2d_a);
+    api.EnqueueWriteBuffer(queue, buf_b, CL_FALSE, 0, bytes, b.data(), 0, nullptr, &ev_h2d_b);
+
+    const auto t_launch_start = std::chrono::steady_clock::now();
+    cl_int launch_rc = api.EnqueueNDRangeKernel(queue, kernel, 1, nullptr,
+                                                &global, &local, 0, nullptr, &ev_kernel);
+    const auto t_launch_end = std::chrono::steady_clock::now();
+    r.timings.kernel_launch = t_launch_end - t_launch_start;
+
+    if (launch_rc != CL_SUCCESS) {
         r.error = "clEnqueueNDRangeKernel failed";
     } else {
-        api.EnqueueReadBuffer(queue, buf_c, CL_TRUE, 0, bytes, c.data(), 0, nullptr, nullptr);
+        api.EnqueueReadBuffer(queue, buf_c, CL_FALSE, 0, bytes, c.data(), 0, nullptr, &ev_d2h);
         api.Finish(queue);
     }
 
-    auto t1 = std::chrono::steady_clock::now();
-    r.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+    r.timings.total = std::chrono::steady_clock::now() - t_total_start;
+
+    // Pull device-side per-event timestamps.
+    if (ev_h2d_a && ev_h2d_b) r.timings.copy_h2d = event_span(api, ev_h2d_a, ev_h2d_b);
+    if (ev_kernel)            r.timings.kernel_compute = event_span(api, ev_kernel, ev_kernel);
+    if (ev_d2h)               r.timings.copy_d2h = event_span(api, ev_d2h, ev_d2h);
+
+    if (ev_h2d_a)  api.ReleaseEvent(ev_h2d_a);
+    if (ev_h2d_b)  api.ReleaseEvent(ev_h2d_b);
+    if (ev_kernel) api.ReleaseEvent(ev_kernel);
+    if (ev_d2h)    api.ReleaseEvent(ev_d2h);
 
     api.ReleaseKernel(kernel);
     api.ReleaseProgram(program);

@@ -41,15 +41,27 @@ example::RunResult dispatch(const gpgpu::Setup&    setup,
     return example::RunResult{};
 }
 
+double to_ms(std::chrono::duration<double> d) { return d.count() * 1000.0; }
+
+double gbps(std::size_t bytes, std::chrono::duration<double> d) {
+    if (d.count() <= 0.0 || bytes == 0) return 0.0;
+    return (static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0)) / d.count();
+}
+
 void print_table(const std::vector<example::RunResult>& rows) {
-    std::printf("\n== Runs ==\n");
-    std::printf("  %-44s  %-7s  %-9s  %10s  %-7s  %s\n",
-                "device", "backend", "pref", "wall(ms)", "correct", "error");
-    std::printf("  %-44s  %-7s  %-9s  %10s  %-7s  %s\n",
+    std::printf("\n== Runs (all durations in ms; bandwidth in GiB/s) ==\n");
+    std::printf("  %-44s  %-7s  %-9s  %9s  %9s  %9s  %9s  %9s  %-7s  %s\n",
+                "device", "backend", "pref",
+                "h2d", "h2d_GBs", "launch", "compute", "d2h", "correct", "error");
+    std::printf("  %-44s  %-7s  %-9s  %9s  %9s  %9s  %9s  %9s  %-7s  %s\n",
                 std::string(44, '-').c_str(),
                 std::string(7, '-').c_str(),
                 std::string(9, '-').c_str(),
-                std::string(10, '-').c_str(),
+                std::string(9, '-').c_str(),
+                std::string(9, '-').c_str(),
+                std::string(9, '-').c_str(),
+                std::string(9, '-').c_str(),
+                std::string(9, '-').c_str(),
                 std::string(7, '-').c_str(),
                 std::string(5, '-').c_str());
     for (const auto& r : rows) {
@@ -62,12 +74,16 @@ void print_table(const std::vector<example::RunResult>& rows) {
             }
         }
         if (label.size() > 44) label.resize(44);
-        const double ms = r.elapsed.count() / 1000.0;
-        std::printf("  %-44s  %-7s  %-9s  %10.3f  %-7s  %s\n",
+        const auto& t = r.timings;
+        std::printf("  %-44s  %-7s  %-9s  %9.3f  %9.2f  %9.3f  %9.3f  %9.3f  %-7s  %s\n",
                     label.c_str(),
                     std::string(gpgpu::to_string(r.backend)).c_str(),
                     std::string(gpgpu::to_string(r.preferred)).c_str(),
-                    ms,
+                    to_ms(t.copy_h2d),
+                    gbps(t.copy_h2d_size, t.copy_h2d),
+                    to_ms(t.kernel_launch),
+                    to_ms(t.kernel_compute),
+                    to_ms(t.copy_d2h),
                     r.correct ? "yes" : "no",
                     r.error.empty() ? "" : r.error.c_str());
     }

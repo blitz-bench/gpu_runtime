@@ -46,6 +46,7 @@ using hipModule_t  = void*;
 using hipFunction_t = void*;
 using hipStream_t  = void*;
 using hipDeviceptr_t = void*;
+using hipEvent_t   = void*;
 constexpr hipError_t hipSuccess = 0;
 
 enum hipMemcpyKind : int {
@@ -61,6 +62,7 @@ using PFN_hipDeviceGetPCIBusId   = hipError_t (HIP_STDCALL*)(char*, int, int);
 using PFN_hipMalloc              = hipError_t (HIP_STDCALL*)(void**, std::size_t);
 using PFN_hipFree                = hipError_t (HIP_STDCALL*)(void*);
 using PFN_hipMemcpy              = hipError_t (HIP_STDCALL*)(void*, const void*, std::size_t, hipMemcpyKind);
+using PFN_hipMemcpyAsync         = hipError_t (HIP_STDCALL*)(void*, const void*, std::size_t, hipMemcpyKind, hipStream_t);
 using PFN_hipDeviceSynchronize   = hipError_t (HIP_STDCALL*)(void);
 using PFN_hipModuleLoadData      = hipError_t (HIP_STDCALL*)(hipModule_t*, const void*);
 using PFN_hipModuleUnload        = hipError_t (HIP_STDCALL*)(hipModule_t);
@@ -71,6 +73,11 @@ using PFN_hipModuleLaunchKernel  = hipError_t (HIP_STDCALL*)(hipFunction_t,
                                                              unsigned, hipStream_t,
                                                              void**, void**);
 using PFN_hipGetErrorString      = const char* (HIP_STDCALL*)(hipError_t);
+using PFN_hipEventCreate         = hipError_t (HIP_STDCALL*)(hipEvent_t*);
+using PFN_hipEventDestroy        = hipError_t (HIP_STDCALL*)(hipEvent_t);
+using PFN_hipEventRecord         = hipError_t (HIP_STDCALL*)(hipEvent_t, hipStream_t);
+using PFN_hipEventSynchronize    = hipError_t (HIP_STDCALL*)(hipEvent_t);
+using PFN_hipEventElapsedTime    = hipError_t (HIP_STDCALL*)(float* /*ms*/, hipEvent_t, hipEvent_t);
 
 struct HipApi {
     PFN_hipInit               Init;
@@ -80,12 +87,18 @@ struct HipApi {
     PFN_hipMalloc             Malloc;
     PFN_hipFree               Free;
     PFN_hipMemcpy             Memcpy;
+    PFN_hipMemcpyAsync        MemcpyAsync;
     PFN_hipDeviceSynchronize  DeviceSynchronize;
     PFN_hipModuleLoadData     ModuleLoadData;
     PFN_hipModuleUnload       ModuleUnload;
     PFN_hipModuleGetFunction  ModuleGetFunction;
     PFN_hipModuleLaunchKernel ModuleLaunchKernel;
     PFN_hipGetErrorString     GetErrorString;
+    PFN_hipEventCreate        EventCreate;
+    PFN_hipEventDestroy       EventDestroy;
+    PFN_hipEventRecord        EventRecord;
+    PFN_hipEventSynchronize   EventSynchronize;
+    PFN_hipEventElapsedTime   EventElapsedTime;
 };
 
 bool resolve_hip(const loader::Lib& lib, HipApi& api) {
@@ -96,16 +109,25 @@ bool resolve_hip(const loader::Lib& lib, HipApi& api) {
     api.Malloc             = lib.sym<PFN_hipMalloc>("hipMalloc");
     api.Free               = lib.sym<PFN_hipFree>("hipFree");
     api.Memcpy             = lib.sym<PFN_hipMemcpy>("hipMemcpy");
+    api.MemcpyAsync        = lib.sym<PFN_hipMemcpyAsync>("hipMemcpyAsync");
     api.DeviceSynchronize  = lib.sym<PFN_hipDeviceSynchronize>("hipDeviceSynchronize");
     api.ModuleLoadData     = lib.sym<PFN_hipModuleLoadData>("hipModuleLoadData");
     api.ModuleUnload       = lib.sym<PFN_hipModuleUnload>("hipModuleUnload");
     api.ModuleGetFunction  = lib.sym<PFN_hipModuleGetFunction>("hipModuleGetFunction");
     api.ModuleLaunchKernel = lib.sym<PFN_hipModuleLaunchKernel>("hipModuleLaunchKernel");
     api.GetErrorString     = lib.sym<PFN_hipGetErrorString>("hipGetErrorString");
+    api.EventCreate        = lib.sym<PFN_hipEventCreate>("hipEventCreate");
+    api.EventDestroy       = lib.sym<PFN_hipEventDestroy>("hipEventDestroy");
+    api.EventRecord        = lib.sym<PFN_hipEventRecord>("hipEventRecord");
+    api.EventSynchronize   = lib.sym<PFN_hipEventSynchronize>("hipEventSynchronize");
+    api.EventElapsedTime   = lib.sym<PFN_hipEventElapsedTime>("hipEventElapsedTime");
     return api.Init && api.GetDeviceCount && api.SetDevice && api.DeviceGetPCIBusId &&
-           api.Malloc && api.Free && api.Memcpy && api.DeviceSynchronize &&
+           api.Malloc && api.Free && api.Memcpy && api.MemcpyAsync &&
+           api.DeviceSynchronize &&
            api.ModuleLoadData && api.ModuleUnload && api.ModuleGetFunction &&
-           api.ModuleLaunchKernel;
+           api.ModuleLaunchKernel &&
+           api.EventCreate && api.EventDestroy && api.EventRecord &&
+           api.EventSynchronize && api.EventElapsedTime;
 }
 
 std::string hip_err(const HipApi& api, hipError_t r) {
@@ -215,7 +237,8 @@ RunResult run_vector_add_rocm(const gpgpu::Setup&    setup,
 
     hip.SetDevice(dev);
 
-    auto t0 = std::chrono::steady_clock::now();
+    r.timings.copy_h2d_size = 2 * bytes;
+    r.timings.copy_d2h_size = bytes;
 
     // Compile HIP source -> code object via hipRTC.
     hiprtcProgram program = nullptr;
@@ -223,7 +246,6 @@ RunResult run_vector_add_rocm(const gpgpu::Setup&    setup,
                           /*numHeaders=*/0, nullptr, nullptr) != HIPRTC_SUCCESS) {
         r.error = "hiprtcCreateProgram failed"; return r;
     }
-
     hiprtcResult crc = rtc.CompileProgram(program, 0, nullptr);
     if (crc != HIPRTC_SUCCESS) {
         std::size_t log_size = 0; rtc.GetProgramLogSize(program, &log_size);
@@ -255,24 +277,55 @@ RunResult run_vector_add_rocm(const gpgpu::Setup&    setup,
     hip.Malloc(&dA, bytes);
     hip.Malloc(&dB, bytes);
     hip.Malloc(&dC, bytes);
-    hip.Memcpy(dA, a.data(), bytes, hipMemcpyHostToDevice);
-    hip.Memcpy(dB, b.data(), bytes, hipMemcpyHostToDevice);
+
+    hipEvent_t ev_h2d_begin = nullptr, ev_h2d_end = nullptr;
+    hipEvent_t ev_k_begin   = nullptr, ev_k_end   = nullptr;
+    hipEvent_t ev_d2h_end   = nullptr;
+    hip.EventCreate(&ev_h2d_begin); hip.EventCreate(&ev_h2d_end);
+    hip.EventCreate(&ev_k_begin);   hip.EventCreate(&ev_k_end);
+    hip.EventCreate(&ev_d2h_end);
 
     std::uint32_t n_arg = static_cast<std::uint32_t>(n);
     void* params[] = { &dA, &dB, &dC, &n_arg };
     const unsigned grid = static_cast<unsigned>((n + kBlockSize - 1) / kBlockSize);
+
+    const auto t_total_start = std::chrono::steady_clock::now();
+
+    hip.EventRecord(ev_h2d_begin, nullptr);
+    hip.MemcpyAsync(dA, a.data(), bytes, hipMemcpyHostToDevice, nullptr);
+    hip.MemcpyAsync(dB, b.data(), bytes, hipMemcpyHostToDevice, nullptr);
+    hip.EventRecord(ev_h2d_end, nullptr);
+
+    hip.EventRecord(ev_k_begin, nullptr);
+    const auto t_launch_start = std::chrono::steady_clock::now();
     hrc = hip.ModuleLaunchKernel(kernel, grid, 1, 1, kBlockSize, 1, 1,
                                  /*sharedMemBytes=*/0, /*stream=*/nullptr,
                                  params, nullptr);
+    r.timings.kernel_launch = std::chrono::steady_clock::now() - t_launch_start;
+    hip.EventRecord(ev_k_end, nullptr);
+
     if (hrc != hipSuccess) {
         r.error = "hipModuleLaunchKernel: " + hip_err(hip, hrc);
     } else {
-        hip.DeviceSynchronize();
-        hip.Memcpy(c.data(), dC, bytes, hipMemcpyDeviceToHost);
+        hip.MemcpyAsync(c.data(), dC, bytes, hipMemcpyDeviceToHost, nullptr);
+        hip.EventRecord(ev_d2h_end, nullptr);
+        hip.EventSynchronize(ev_d2h_end);
     }
 
-    auto t1 = std::chrono::steady_clock::now();
-    r.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+    r.timings.total = std::chrono::steady_clock::now() - t_total_start;
+
+    auto ms_between = [&](hipEvent_t a, hipEvent_t b) -> std::chrono::duration<double> {
+        float ms = 0.0f;
+        if (hip.EventElapsedTime(&ms, a, b) != hipSuccess || ms < 0) return {};
+        return std::chrono::duration<double>{ms / 1000.0};
+    };
+    r.timings.copy_h2d       = ms_between(ev_h2d_begin, ev_h2d_end);
+    r.timings.kernel_compute = ms_between(ev_k_begin,   ev_k_end);
+    r.timings.copy_d2h       = ms_between(ev_k_end,     ev_d2h_end);
+
+    hip.EventDestroy(ev_h2d_begin); hip.EventDestroy(ev_h2d_end);
+    hip.EventDestroy(ev_k_begin);   hip.EventDestroy(ev_k_end);
+    hip.EventDestroy(ev_d2h_end);
 
     hip.Free(dA); hip.Free(dB); hip.Free(dC);
     hip.ModuleUnload(module);

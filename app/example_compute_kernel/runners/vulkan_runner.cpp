@@ -81,6 +81,11 @@ struct DeviceApi {
     VKAPI(CmdDispatch);
     VKAPI(QueueSubmit);
     VKAPI(QueueWaitIdle);
+    VKAPI(CreateQueryPool);
+    VKAPI(DestroyQueryPool);
+    VKAPI(CmdResetQueryPool);
+    VKAPI(CmdWriteTimestamp);
+    VKAPI(GetQueryPoolResults);
 };
 #undef VKAPI
 
@@ -140,6 +145,11 @@ void load_device(const InstanceApi& i, VkDevice dev, DeviceApi& a) {
     LOAD_DEVICE(a, CmdDispatch, dev);
     LOAD_DEVICE(a, QueueSubmit, dev);
     LOAD_DEVICE(a, QueueWaitIdle, dev);
+    LOAD_DEVICE(a, CreateQueryPool, dev);
+    LOAD_DEVICE(a, DestroyQueryPool, dev);
+    LOAD_DEVICE(a, CmdResetQueryPool, dev);
+    LOAD_DEVICE(a, CmdWriteTimestamp, dev);
+    LOAD_DEVICE(a, GetQueryPoolResults, dev);
 }
 
 #undef LOAD_GLOBAL
@@ -271,6 +281,9 @@ RunResult run_vector_add_vulkan(const gpgpu::Setup&    setup,
     const std::size_t   n     = a.size();
     const VkDeviceSize  bytes = n * sizeof(float);
 
+    r.timings.copy_h2d_size = 2 * bytes;
+    r.timings.copy_d2h_size = bytes;
+
     loader::Lib lib(setup.backend.path());
     if (!lib.ok()) { r.error = "dlopen(" + setup.backend.path() + ") failed"; return r; }
 
@@ -300,14 +313,18 @@ RunResult run_vector_add_vulkan(const gpgpu::Setup&    setup,
     InstanceApi i{};
     load_instance(g, inst, i);
 
-    auto t0 = std::chrono::steady_clock::now();
-
     VkPhysicalDevice pd = find_matching_device(i, inst, setup.device);
     if (!pd) {
         i.DestroyInstance(inst, nullptr);
         r.error = "no Vulkan device matched " + setup.device.id();
         return r;
     }
+
+    // Pull timestamp characteristics for kernel_compute reporting.
+    VkPhysicalDeviceProperties pd_props{};
+    i.GetPhysicalDeviceProperties(pd, &pd_props);
+    const float    ts_period_ns = pd_props.limits.timestampPeriod;     // ns per tick
+    const bool     ts_supported = pd_props.limits.timestampComputeAndGraphics != 0;
 
     const std::uint32_t qfam = find_compute_queue_family(i, pd);
     if (qfam == UINT32_MAX) {
@@ -345,13 +362,25 @@ RunResult run_vector_add_vulkan(const gpgpu::Setup&    setup,
 
     // --- buffers ---
     BufferAlloc bA{}, bB{}, bC{};
+    // Declared up-front so goto cleanup_dev / cleanup_bufs don't cross init.
+    std::chrono::steady_clock::time_point t_total_start{};
+
     bool buf_ok = create_buffer(d, dev, mp, bytes, bA) &&
                   create_buffer(d, dev, mp, bytes, bB) &&
                   create_buffer(d, dev, mp, bytes, bC);
     if (!buf_ok) { r.error = "buffer alloc failed"; goto cleanup_dev; }
-    if (!upload(d, dev, bA.mem, a.data(), bytes) ||
-        !upload(d, dev, bB.mem, b.data(), bytes)) {
-        r.error = "MapMemory upload failed"; goto cleanup_bufs;
+
+    // ---- timed: host-coherent memcpy uploads are pure host work, so
+    // copy_h2d is wall-time around them; kernel and total use the section
+    // markers further down.
+    t_total_start = std::chrono::steady_clock::now();
+    {
+        const auto t_h2d_start = std::chrono::steady_clock::now();
+        if (!upload(d, dev, bA.mem, a.data(), bytes) ||
+            !upload(d, dev, bB.mem, b.data(), bytes)) {
+            r.error = "MapMemory upload failed"; goto cleanup_bufs;
+        }
+        r.timings.copy_h2d = std::chrono::steady_clock::now() - t_h2d_start;
     }
 
     // --- shader module ---
@@ -444,7 +473,7 @@ RunResult run_vector_add_vulkan(const gpgpu::Setup&    setup,
     }
     d.UpdateDescriptorSets(dev, 3, writes, 0, nullptr);
 
-    // --- command pool + buffer ---
+    // --- command pool + buffer + timestamp query pool ---
     VkCommandPoolCreateInfo cpoolci{};
     cpoolci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpoolci.queueFamilyIndex = qfam;
@@ -460,11 +489,25 @@ RunResult run_vector_add_vulkan(const gpgpu::Setup&    setup,
     VkCommandBuffer cb = VK_NULL_HANDLE;
     d.AllocateCommandBuffers(dev, &cbai, &cb);
 
+    // Two timestamps: top-of-pipe before dispatch and bottom-of-pipe after.
+    VkQueryPool qpool = VK_NULL_HANDLE;
+    if (ts_supported) {
+        VkQueryPoolCreateInfo qpci{};
+        qpci.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 2;
+        d.CreateQueryPool(dev, &qpci, nullptr, &qpool);
+    }
+
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     d.BeginCommandBuffer(cb, &bi);
 
+    if (qpool) {
+        d.CmdResetQueryPool(cb, qpool, 0, 2);
+        d.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
+    }
     d.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     d.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl,
                             0, 1, &dset, 0, nullptr);
@@ -473,21 +516,43 @@ RunResult run_vector_add_vulkan(const gpgpu::Setup&    setup,
     const std::uint32_t groups = static_cast<std::uint32_t>(
         (n + kLocalSize - 1) / kLocalSize);
     d.CmdDispatch(cb, groups, 1, 1);
+    if (qpool) {
+        d.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 1);
+    }
     d.EndCommandBuffer(cb);
 
     VkSubmitInfo si{};
     si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &cb;
-    if (d.QueueSubmit(queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
+
+    const auto t_launch_start = std::chrono::steady_clock::now();
+    VkResult sub_rc = d.QueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    r.timings.kernel_launch = std::chrono::steady_clock::now() - t_launch_start;
+
+    if (sub_rc != VK_SUCCESS) {
         r.error = "vkQueueSubmit failed";
     } else {
         d.QueueWaitIdle(queue);
+        if (qpool) {
+            std::uint64_t ts[2] = {0, 0};
+            if (d.GetQueryPoolResults(dev, qpool, 0, 2, sizeof(ts), ts, sizeof(std::uint64_t),
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS
+                && ts[1] > ts[0]) {
+                const double ns = static_cast<double>(ts[1] - ts[0]) * ts_period_ns;
+                r.timings.kernel_compute = std::chrono::duration<double>{ns / 1.0e9};
+            }
+        }
+        const auto t_d2h_start = std::chrono::steady_clock::now();
         if (!download(d, dev, bC.mem, c.data(), bytes)) {
             r.error = "MapMemory download failed";
         }
+        r.timings.copy_d2h = std::chrono::steady_clock::now() - t_d2h_start;
     }
 
+    r.timings.total = std::chrono::steady_clock::now() - t_total_start;
+
+    if (qpool) d.DestroyQueryPool(dev, qpool, nullptr);
     d.DestroyCommandPool(dev, cpool, nullptr);
     d.DestroyDescriptorPool(dev, dpool, nullptr);
     d.DestroyPipeline(dev, pipeline, nullptr);
@@ -503,9 +568,6 @@ cleanup_bufs:
 cleanup_dev:
     if (d.DestroyDevice) d.DestroyDevice(dev, nullptr);
     i.DestroyInstance(inst, nullptr);
-
-    auto t1 = std::chrono::steady_clock::now();
-    r.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
 
     if (!r.error.empty()) return r;
 

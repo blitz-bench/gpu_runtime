@@ -62,6 +62,12 @@ using PFN_zeKernelSetArgumentValue     = ze_result_t (ZE_APICALL*)(ze_kernel_han
 using PFN_zeMemAllocDevice             = ze_result_t (ZE_APICALL*)(ze_context_handle_t, const ze_device_mem_alloc_desc_t*,
                                                                    size_t, size_t, ze_device_handle_t, void**);
 using PFN_zeMemFree                    = ze_result_t (ZE_APICALL*)(ze_context_handle_t, void*);
+using PFN_zeEventPoolCreate            = ze_result_t (ZE_APICALL*)(ze_context_handle_t, const ze_event_pool_desc_t*,
+                                                                   uint32_t, ze_device_handle_t*, ze_event_pool_handle_t*);
+using PFN_zeEventPoolDestroy           = ze_result_t (ZE_APICALL*)(ze_event_pool_handle_t);
+using PFN_zeEventCreate                = ze_result_t (ZE_APICALL*)(ze_event_pool_handle_t, const ze_event_desc_t*, ze_event_handle_t*);
+using PFN_zeEventDestroy               = ze_result_t (ZE_APICALL*)(ze_event_handle_t);
+using PFN_zeEventQueryKernelTimestamp  = ze_result_t (ZE_APICALL*)(ze_event_handle_t, ze_kernel_timestamp_result_t*);
 
 struct ZeApi {
     PFN_zeInit                            Init;
@@ -89,6 +95,11 @@ struct ZeApi {
     PFN_zeKernelSetArgumentValue          KernelSetArgumentValue;
     PFN_zeMemAllocDevice                  MemAllocDevice;
     PFN_zeMemFree                         MemFree;
+    PFN_zeEventPoolCreate                 EventPoolCreate;
+    PFN_zeEventPoolDestroy                EventPoolDestroy;
+    PFN_zeEventCreate                     EventCreate;
+    PFN_zeEventDestroy                    EventDestroy;
+    PFN_zeEventQueryKernelTimestamp       EventQueryKernelTimestamp;
 };
 
 bool resolve(const loader::Lib& lib, ZeApi& api) {
@@ -117,6 +128,11 @@ bool resolve(const loader::Lib& lib, ZeApi& api) {
     api.KernelSetArgumentValue          = lib.sym<PFN_zeKernelSetArgumentValue>("zeKernelSetArgumentValue");
     api.MemAllocDevice                  = lib.sym<PFN_zeMemAllocDevice>("zeMemAllocDevice");
     api.MemFree                         = lib.sym<PFN_zeMemFree>("zeMemFree");
+    api.EventPoolCreate                 = lib.sym<PFN_zeEventPoolCreate>("zeEventPoolCreate");
+    api.EventPoolDestroy                = lib.sym<PFN_zeEventPoolDestroy>("zeEventPoolDestroy");
+    api.EventCreate                     = lib.sym<PFN_zeEventCreate>("zeEventCreate");
+    api.EventDestroy                    = lib.sym<PFN_zeEventDestroy>("zeEventDestroy");
+    api.EventQueryKernelTimestamp       = lib.sym<PFN_zeEventQueryKernelTimestamp>("zeEventQueryKernelTimestamp");
     return api.Init && api.DriverGet && api.DeviceGet && api.DeviceGetProperties &&
            api.ContextCreate && api.ContextDestroy &&
            api.CommandQueueCreate && api.CommandQueueDestroy &&
@@ -126,7 +142,9 @@ bool resolve(const loader::Lib& lib, ZeApi& api) {
            api.ModuleCreate && api.ModuleDestroy &&
            api.KernelCreate && api.KernelDestroy &&
            api.KernelSetGroupSize && api.KernelSetArgumentValue &&
-           api.MemAllocDevice && api.MemFree;
+           api.MemAllocDevice && api.MemFree &&
+           api.EventPoolCreate && api.EventPoolDestroy &&
+           api.EventCreate && api.EventDestroy && api.EventQueryKernelTimestamp;
 }
 
 std::string format_uuid(const std::uint8_t u[ZE_MAX_DEVICE_UUID_SIZE]) {
@@ -203,7 +221,14 @@ RunResult run_vector_add_oneapi(const gpgpu::Setup&    setup,
         return r;
     }
 
-    auto t0 = std::chrono::steady_clock::now();
+    r.timings.copy_h2d_size = 2 * bytes;
+    r.timings.copy_d2h_size = bytes;
+
+    // Capture timerResolution so we can convert kernel-timestamp ticks to ns.
+    ze_device_properties_t dev_props{};
+    dev_props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+    api.DeviceGetProperties(dev, &dev_props);
+    const std::uint64_t timer_res_ns = dev_props.timerResolution; // ns per tick
 
     ze_context_desc_t ctx_desc{};
     ctx_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
@@ -289,26 +314,70 @@ RunResult run_vector_add_oneapi(const gpgpu::Setup&    setup,
     api.KernelSetArgumentValue(kernel, 2, sizeof(void*),      &dC);
     api.KernelSetArgumentValue(kernel, 3, sizeof(std::uint32_t), &n_arg);
 
-    api.CommandListAppendMemoryCopy(list, dA, a.data(), bytes, nullptr, 0, nullptr);
-    api.CommandListAppendMemoryCopy(list, dB, b.data(), bytes, nullptr, 0, nullptr);
+    // Kernel-timestamp event pool: 4 events bracket the 4 commands.
+    ze_event_pool_desc_t epd{};
+    epd.stype = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+    epd.flags = ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP;
+    epd.count = 4;
+    ze_event_pool_handle_t epool = nullptr;
+    api.EventPoolCreate(ctx, &epd, 1, &dev, &epool);
+
+    auto make_event = [&](std::uint32_t index) {
+        ze_event_desc_t ed{};
+        ed.stype  = ZE_STRUCTURE_TYPE_EVENT_DESC;
+        ed.index  = index;
+        ed.signal = ZE_EVENT_SCOPE_FLAG_HOST;
+        ze_event_handle_t e = nullptr;
+        api.EventCreate(epool, &ed, &e);
+        return e;
+    };
+    ze_event_handle_t ev_h2d_a = make_event(0);
+    ze_event_handle_t ev_h2d_b = make_event(1);
+    ze_event_handle_t ev_kernel = make_event(2);
+    ze_event_handle_t ev_d2h   = make_event(3);
 
     ze_group_count_t groups{};
     groups.groupCountX = static_cast<std::uint32_t>((n + kGroupSize - 1) / kGroupSize);
     groups.groupCountY = 1;
     groups.groupCountZ = 1;
-    api.CommandListAppendLaunchKernel(list, kernel, &groups, nullptr, 0, nullptr);
 
-    api.CommandListAppendMemoryCopy(list, c.data(), dC, bytes, nullptr, 0, nullptr);
+    api.CommandListAppendMemoryCopy(list, dA, a.data(), bytes, ev_h2d_a, 0, nullptr);
+    api.CommandListAppendMemoryCopy(list, dB, b.data(), bytes, ev_h2d_b, 0, nullptr);
+
+    const auto t_launch_start = std::chrono::steady_clock::now();
+    api.CommandListAppendLaunchKernel(list, kernel, &groups, ev_kernel, 0, nullptr);
+    r.timings.kernel_launch = std::chrono::steady_clock::now() - t_launch_start;
+
+    api.CommandListAppendMemoryCopy(list, c.data(), dC, bytes, ev_d2h, 0, nullptr);
     api.CommandListClose(list);
 
+    const auto t_total_start = std::chrono::steady_clock::now();
     if (api.CommandQueueExecuteCommandLists(queue, 1, &list, nullptr) != ZE_RESULT_SUCCESS) {
         r.error = "zeCommandQueueExecuteCommandLists failed";
     } else {
         api.CommandQueueSynchronize(queue, UINT64_MAX);
     }
+    r.timings.total = std::chrono::steady_clock::now() - t_total_start;
 
-    auto t1 = std::chrono::steady_clock::now();
-    r.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+    auto kts = [&](ze_event_handle_t e) -> std::pair<std::uint64_t, std::uint64_t> {
+        ze_kernel_timestamp_result_t ts{};
+        if (api.EventQueryKernelTimestamp(e, &ts) != ZE_RESULT_SUCCESS) return {0, 0};
+        return {ts.global.kernelStart, ts.global.kernelEnd};
+    };
+    auto to_seconds = [&](std::uint64_t ticks) {
+        return std::chrono::duration<double>{ticks * static_cast<double>(timer_res_ns) / 1.0e9};
+    };
+    auto [h2da_s, h2da_e] = kts(ev_h2d_a);
+    auto [h2db_s, h2db_e] = kts(ev_h2d_b);
+    auto [k_s, k_e]       = kts(ev_kernel);
+    auto [d2h_s, d2h_e]   = kts(ev_d2h);
+    if (h2db_e > h2da_s)  r.timings.copy_h2d       = to_seconds(h2db_e - h2da_s);
+    if (k_e    > k_s)     r.timings.kernel_compute = to_seconds(k_e    - k_s);
+    if (d2h_e  > d2h_s)   r.timings.copy_d2h       = to_seconds(d2h_e  - d2h_s);
+
+    api.EventDestroy(ev_h2d_a); api.EventDestroy(ev_h2d_b);
+    api.EventDestroy(ev_kernel); api.EventDestroy(ev_d2h);
+    api.EventPoolDestroy(epool);
 
     api.MemFree(ctx, dA);
     api.MemFree(ctx, dB);
