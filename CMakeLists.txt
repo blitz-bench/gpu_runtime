@@ -102,4 +102,5 @@ endif()
 
 if(BUILD_SAMPLE_APP)
     add_subdirectory(app/gpu_runtime_query)
+    add_subdirectory(app/example_compute_kernel)
 endif()
