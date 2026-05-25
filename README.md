@@ -15,10 +15,6 @@ cmake --build build
 ./build/app/gpu_runtime_query/gpu_runtime_query
 ```
 
-`CMakeLists.txt` checks the submodules are present at configure time and
-emits a clear error pointing at `git submodule update --init --recursive` if
-they aren't.
-
 ## Third-party headers
 
 Three GPGPU API header sets are pulled in as git submodules under `external/`.
@@ -37,13 +33,13 @@ update in this repository.
 
 ### Not vendored
 
-- **NVIDIA CUDA** headers — proprietary license, redistribution not permitted.
+- **NVIDIA CUDA** headers: proprietary license, redistribution not permitted.
   The CUDA backend (`src/backends/cuda.cpp`) declares the small Driver-API
   subset it uses inline.
-- **AMD HIP / ROCm** headers — MIT-licensed, but `hip_runtime_api.h` is 10 K+
+- **AMD HIP / ROCm** headers: MIT-licensed, but `hip_runtime_api.h` is 10 K+
   lines and transitively pulls in `nvidia_detail/` and `amd_detail/` paths
   that require full CUDA / ROCm SDK installations. The HIP backend
   (`src/backends/rocm.cpp`) declares the small Runtime-API subset it uses
   inline.
-- **Apple Metal** — `<Metal/Metal.h>` is part of the macOS system SDK and is
+- **Apple Metal**: `<Metal/Metal.h>` is part of the macOS system SDK and is
   `#import`ed directly when building on Apple platforms.
