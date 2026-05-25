@@ -1,0 +1,25 @@
+// Vector addition compute shader.
+//
+// This is the SOURCE FORM used by the Vulkan + Level Zero runners. After
+// edits, regenerate the committed SPIR-V byte array with:
+//
+//   glslangValidator -V vector_add.comp -o vector_add.spv
+//   xxd -i vector_add.spv > vector_add.spv.inl
+//
+// then tidy the generated header so the array is named kVectorAddSpv and
+// declared `constexpr uint32_t kVectorAddSpv[]`.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer A { float a[]; };
+layout(set = 0, binding = 1, std430) readonly  buffer B { float b[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) c[i] = a[i] + b[i];
+}
