@@ -45,7 +45,7 @@ struct PciBusInfoKhr {
 };
 
 // NVIDIA-specific OpenCL extension query keys (cl_nv_device_attribute_query).
-// These are not part of the Khronos headers — NVIDIA documents them in their
+// These are not part of the Khronos headers - NVIDIA documents them in their
 // OpenCL Best Practices Guide but does not contribute them upstream.
 constexpr cl_device_info CL_DEVICE_PCI_BUS_ID_NV  = 0x4008;
 constexpr cl_device_info CL_DEVICE_PCI_SLOT_ID_NV = 0x4009;

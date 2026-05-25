@@ -18,7 +18,7 @@ cmake --build build
 ## Third-party headers
 
 Three GPGPU API header sets are pulled in as git submodules under `external/`.
-None of the vendor runtimes is required at build time — the libraries are
+None of the vendor runtimes is required at build time - the libraries are
 `dlopen`'d at runtime.
 
 | Submodule | Upstream | License |

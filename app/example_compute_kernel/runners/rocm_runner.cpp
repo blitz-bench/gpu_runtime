@@ -1,4 +1,4 @@
-// HIP / ROCm vector-add runner — single-file, no shared abstraction.
+// HIP / ROCm vector-add runner - single-file, no shared abstraction.
 //
 // Uses HIP's Driver-style module API for execution and hipRTC for
 // runtime kernel compilation. Two libraries are opened:
@@ -29,7 +29,7 @@ namespace {
 #  define HIP_STDCALL
 #endif
 
-// Standard HIP source — same expression as the OpenCL kernel.
+// Standard HIP source - same expression as the OpenCL kernel.
 constexpr const char* kHipSource = R"HIP(
 extern "C" __global__ void vector_add(const float* a, const float* b, float* c, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -223,9 +223,8 @@ RunResult run_vector_add_rocm(const gpgpu::Setup&    setup,
                           /*numHeaders=*/0, nullptr, nullptr) != HIPRTC_SUCCESS) {
         r.error = "hiprtcCreateProgram failed"; return r;
     }
-    // No --gpu-architecture option: hipRTC defaults to the active device's arch.
-    const char* opts[] = {};
-    hiprtcResult crc = rtc.CompileProgram(program, 0, opts);
+
+    hiprtcResult crc = rtc.CompileProgram(program, 0, nullptr);
     if (crc != HIPRTC_SUCCESS) {
         std::size_t log_size = 0; rtc.GetProgramLogSize(program, &log_size);
         std::string log(log_size, '\0');

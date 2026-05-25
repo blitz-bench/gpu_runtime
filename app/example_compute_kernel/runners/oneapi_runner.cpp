@@ -1,4 +1,4 @@
-// OneAPI / Level Zero vector-add runner — single-file, no shared abstraction.
+// OneAPI / Level Zero vector-add runner - single-file, no shared abstraction.
 //
 // Walks the L0 compute path: zeInit -> find driver+device matching
 // setup.device.id() -> context -> command queue + immediate command list ->
@@ -180,7 +180,7 @@ RunResult run_vector_add_oneapi(const gpgpu::Setup&    setup,
         r.error = "vector size mismatch"; return r;
     }
     if (kVectorAddSpvBytesLen == 0) {
-        r.error = "SPIR-V is empty — regenerate shaders/vector_add.spv.inl";
+        r.error = "SPIR-V is empty - regenerate shaders/vector_add.spv.inl";
         return r;
     }
     const std::size_t n     = a.size();

@@ -1,4 +1,4 @@
-// CUDA vector-add runner — single-file, no shared abstraction.
+// CUDA vector-add runner - single-file, no shared abstraction.
 //
 // Uses the CUDA Driver API exclusively. The kernel ships as inline PTX so
 // the runner has zero build-time CUDA Toolkit dependency. NVIDIA's `cuda.h`
@@ -130,7 +130,7 @@ struct CuApi {
     PFN_cuGetErrorString     GetErrorString;
 };
 
-// Prefer the _v2 variants when available — they take size_t byte counts
+// Prefer the _v2 variants when available - they take size_t byte counts
 // and are the current Driver-API entry points on every CUDA 4.0+ driver.
 template <typename Fn>
 Fn resolve_with_v2(const loader::Lib& lib, const char* base) {

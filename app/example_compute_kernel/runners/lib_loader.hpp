@@ -3,7 +3,7 @@
 // Tiny header-only OS shim so each runner can re-open the shared library
 // gpu_runtime already located (via setup.backend.path()) without having to
 // duplicate dlopen / LoadLibrary boilerplate. Intentionally NOT a backend
-// abstraction — every runner still drives its backend directly.
+// abstraction - every runner still drives its backend directly.
 
 #include <string>
 #include <utility>

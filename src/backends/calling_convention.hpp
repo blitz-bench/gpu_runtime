@@ -3,9 +3,9 @@
 // Calling-convention macro for the two backends whose entry points use
 // __stdcall on Windows and where we cannot include the vendor headers:
 //
-//   - CUDA   (cuda.h: CUDAAPI = __stdcall) — NVIDIA license forbids
+//   - CUDA   (cuda.h: CUDAAPI = __stdcall) - NVIDIA license forbids
 //            redistribution of the headers, so we hand-roll declarations.
-//   - HIP    (hip_runtime_api.h on Windows uses __stdcall via HIPAPI) — the
+//   - HIP    (hip_runtime_api.h on Windows uses __stdcall via HIPAPI) - the
 //            header is MIT-licensed but transitively requires the CUDA / ROCm
 //            SDK installation, so we hand-roll a minimal subset.
 //

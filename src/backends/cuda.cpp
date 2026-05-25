@@ -2,7 +2,7 @@
 // resolve only the entry points we need. No vendor SDK is required at build
 // time.
 //
-// Reference: CUDA Driver API stability guarantee — the symbols and the
+// Reference: CUDA Driver API stability guarantee - the symbols and the
 // `CUdevice_attribute` enum values used below have been ABI-stable since
 // CUDA 7. We deliberately stick to long-standing attributes.
 
@@ -62,7 +62,7 @@ std::uint32_t cores_per_sm(int major, int minor) {
     }
     if (major == 7) {
         if (minor == 0 || minor == 2) return 64;   // V100, Xavier
-        return 64;                                  // Turing 7.5 — 64 FP32 per SM
+        return 64;                                  // Turing 7.5 - 64 FP32 per SM
     }
     if (major == 8) {
         if (minor == 0) return 64;                 // A100

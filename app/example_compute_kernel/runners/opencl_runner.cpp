@@ -1,4 +1,4 @@
-// OpenCL vector-add runner — single-file, no shared abstraction.
+// OpenCL vector-add runner - single-file, no shared abstraction.
 //
 // Pipeline:
 //   1. dlopen the OpenCL ICD loader at setup.backend.path().

@@ -1,8 +1,8 @@
-// example_compute_kernel — end-to-end usage example for gpu_runtime.
+// example_compute_kernel - end-to-end usage example for gpu_runtime.
 //
 // Discovers backends + devices via gpu_runtime, then dispatches a small
 // vector-addition kernel through whichever per-backend runner matches each
-// Setup. Each runner is a standalone reference for its backend — there is
+// Setup. Each runner is a standalone reference for its backend - there is
 // no shared abstraction.
 
 #include <algorithm>
@@ -76,7 +76,7 @@ void print_table(const std::vector<example::RunResult>& rows) {
 } // namespace
 
 int main() {
-    std::printf("example_compute_kernel — vector add (%zu elements) across all "
+    std::printf("example_compute_kernel - vector add (%zu elements) across all "
                 "available (device, backend) pairs\n",
                 kElementCount);
 

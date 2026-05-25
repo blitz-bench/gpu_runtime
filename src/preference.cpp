@@ -25,7 +25,7 @@ BackendId pick_fallback(const std::vector<BackendId>& available) {
     if (contains(available, BackendId::OpenCL)) return BackendId::OpenCL;
     if (contains(available, BackendId::Vulkan)) return BackendId::Vulkan;
     // Otherwise the first available wins (e.g. only Metal on macOS for a
-    // non-Apple GPU — unlikely but defined).
+    // non-Apple GPU - unlikely but defined).
     return available.empty() ? BackendId::OpenCL : available.front();
 }
 

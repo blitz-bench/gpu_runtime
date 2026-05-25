@@ -1,5 +1,5 @@
 // Metal vector-add runner (macOS only). Uses the linked Metal system
-// framework directly — Apple frameworks are not dlopen'd from app code.
+// framework directly - Apple frameworks are not dlopen'd from app code.
 //
 // metal_runner_stub.cpp provides the run_vector_add_metal symbol on
 // non-Apple builds.
